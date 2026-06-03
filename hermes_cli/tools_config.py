@@ -279,6 +279,14 @@ TOOL_CATEGORIES = {
                 "tts_provider": "piper",
                 "post_setup": "piper",
             },
+            {
+                "name": "Silero",
+                "badge": "local · free",
+                "tag": "Local PyTorch TTS, 10+ languages, multi-speaker (~800MB)",
+                "env_vars": [],
+                "tts_provider": "silero",
+                "post_setup": "silero",
+            },
         ],
     },
     "web": {
@@ -978,6 +986,30 @@ def _run_post_setup(post_setup_key: str):
         _print_info("    Default voice: en_US-lessac-medium (downloaded on first TTS call)")
         _print_info("    Full voice list: https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/VOICES.md")
         _print_info("    Switch voices by setting tts.piper.voice in ~/.hermes/config.yaml")
+
+    elif post_setup_key == "silero":
+        try:
+            import silero  # noqa: F401
+            _print_success("    silero is already installed")
+        except ImportError:
+            _print_info("    Installing silero + PyTorch (~800MB)...")
+            try:
+                result = _pip_install(["-U", "silero", "--quiet"], timeout=600)
+                if result.returncode == 0:
+                    _print_success("    silero installed")
+                else:
+                    _print_warning("    silero install failed:")
+                    _print_info(f"      {(result.stderr or '').strip()[:300]}")
+                    _print_info("    Run manually: uv pip install -U silero")
+                    return
+            except subprocess.TimeoutExpired:
+                _print_warning("    silero install timed out (>10min)")
+                _print_info("    Run manually: uv pip install -U silero")
+                return
+        _print_info("    Default model: v5_ru (Russian, 5 speakers, downloaded on first TTS call)")
+        _print_info("    Languages: ru, en, de, es, fr, uk, uz, kk")
+        _print_info("    Configure in ~/.hermes/config.yaml under tts.silero:")
+        _print_info("      language, model, voice, sample_rate")
 
     elif post_setup_key == "ddgs":
         try:
