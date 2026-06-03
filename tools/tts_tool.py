@@ -13,6 +13,7 @@ Built-in TTS providers:
 - NeuTTS (local, free, no API key): On-device TTS via neutts
 - KittenTTS (local, free, no API key): On-device 25MB model
 - Piper (local, free, no API key): OHF-Voice/piper1-gpl neural VITS, 44 languages
+- Silero (local, free, no API key): PyTorch-based, 10+ languages, multi-speaker
 
 Custom command providers:
 - Users can declare any number of named providers with ``type: command``
@@ -162,6 +163,24 @@ def _import_piper():
     return PiperVoice
 
 
+def _import_silero():
+    """Lazy import Silero TTS. Returns the module or raises ImportError.
+
+    Silero is a local PyTorch-based TTS engine with multi-language support
+    (en, ru, de, es, fr, uk, uz, kk) and multi-speaker models. Requires the
+    ``silero`` package which pulls in PyTorch (~800MB).
+    """
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+        _lazy_ensure("tts.silero", prompt=False)
+    except ImportError:
+        pass
+    except Exception as e:
+        raise ImportError(str(e))
+    import silero
+    return silero
+
+
 # ===========================================================================
 # Defaults
 # ===========================================================================
@@ -194,6 +213,11 @@ DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
 GEMINI_TTS_SAMPLE_WIDTH = 2  # 16-bit PCM (L16)
+# Silero TTS defaults — local PyTorch-based, multi-language, multi-speaker
+DEFAULT_SILERO_LANGUAGE = "ru"
+DEFAULT_SILERO_MODEL = "v5_ru"
+DEFAULT_SILERO_VOICE = "kseniya"
+DEFAULT_SILERO_SAMPLE_RATE = 48000
 
 def _get_default_output_dir() -> str:
     from hermes_constants import get_hermes_dir
@@ -219,6 +243,7 @@ PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "neutts": 2000,       # local model, quality falls off on long text
     "kittentts": 2000,    # local 25MB model
     "piper": 5000,        # local VITS model, phoneme-based; practical cap
+    "silero": 5000,       # local PyTorch model, practical cap
 }
 
 # ElevenLabs caps vary by model_id. https://elevenlabs.io/docs/overview/models
@@ -365,6 +390,7 @@ BUILTIN_TTS_PROVIDERS = frozenset({
     "neutts",
     "kittentts",
     "piper",
+    "silero",
 })
 
 DEFAULT_COMMAND_TTS_TIMEOUT_SECONDS = 120
@@ -1832,6 +1858,100 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 
 
 # ===========================================================================
+# Provider: Silero (local, PyTorch-based, multi-language, multi-speaker)
+# ===========================================================================
+
+# Module-level cache for Silero model instances — keyed on model name.
+_silero_model_cache: Dict[str, Any] = {}
+
+
+def _check_silero_available() -> bool:
+    """Check whether the silero package is importable."""
+    try:
+        import importlib.util
+        return importlib.util.find_spec("silero") is not None
+    except Exception:
+        return False
+
+
+def _generate_silero_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate speech using the local Silero TTS engine.
+
+    Silero's API (silero v0.5.x):
+      1. ``silero.silero_tts(language, speaker)`` loads a model + returns ``(model, example_text)``.
+         The ``speaker`` parameter here selects the model variant (e.g. ``v5_ru``, ``v3_en``).
+      2. ``model.apply_tts(text, speaker=voice, sample_rate=...)`` synthesizes audio.
+         The ``speaker`` parameter here selects the voice within the model.
+      3. The model returns a torch.float32 1-D tensor at the requested sample rate.
+
+    We write WAV via stdlib ``wave`` (int16), then ffmpeg-convert to MP3/Opus
+    when the caller requested a different format.
+
+    Note: Silero models do not support speed control -- the speed parameter
+    is silently ignored.
+    """
+    silero = _import_silero()
+    import numpy as np
+    import wave
+
+    silero_config = tts_config.get("silero", {}) if isinstance(tts_config, dict) else {}
+    language = silero_config.get("language", DEFAULT_SILERO_LANGUAGE)
+    model_name = silero_config.get("model", DEFAULT_SILERO_MODEL)
+    voice = silero_config.get("voice", DEFAULT_SILERO_VOICE)
+    sample_rate = int(silero_config.get("sample_rate", DEFAULT_SILERO_SAMPLE_RATE))
+
+    # Load model (cached by model name so subsequent calls are fast)
+    cache_key = f"{model_name}::{language}"
+    global _silero_model_cache
+    if cache_key not in _silero_model_cache:
+        logger.info("[Silero] Loading model: %s (language: %s)", model_name, language)
+        from silero import silero_tts
+        _silero_model_cache[cache_key] = silero_tts(language=language, speaker=model_name)
+        logger.info("[Silero] Model loaded")
+
+    model, _example = _silero_model_cache[cache_key]
+
+    # Synthesize — model.apply_tts() returns torch.float32 tensor
+    logger.info("[Silero] Synthesizing with voice: %s", voice)
+    import torch
+    with torch.no_grad():
+        audio_tensor = model.apply_tts(text, speaker=voice, sample_rate=sample_rate)
+
+    # Convert torch float32 tensor -> numpy int16 for WAV.
+    # Silero outputs audio in [-1.0, 1.0] range; scale to int16 first,
+    # then clip to avoid overflow on edge cases.
+    audio_np = audio_tensor.cpu().numpy()
+    audio_int16 = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
+
+    # Write WAV
+    wav_path = output_path
+    if not output_path.endswith(".wav"):
+        wav_path = output_path.rsplit(".", 1)[0] + ".wav"
+
+    with wave.open(wav_path, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)  # 16-bit
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(audio_int16.tobytes())
+
+    # Convert to desired format if caller requested mp3/ogg
+    if wav_path != output_path:
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
+            subprocess.run(conv_cmd, check=True, timeout=30)
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
+        else:
+            # No ffmpeg -- keep WAV
+            os.rename(wav_path, output_path)
+
+    return output_path
+
+
+# ===========================================================================
 # Main tool function
 # ===========================================================================
 def text_to_speech_tool(
@@ -2038,6 +2158,19 @@ def text_to_speech_tool(
             logger.info("Generating speech with Piper (local)...")
             _generate_piper_tts(text, file_str, tts_config)
 
+        elif provider == "silero":
+            try:
+                _import_silero()
+            except ImportError:
+                return json.dumps({
+                    "success": False,
+                    "error": "Silero provider selected but 'silero' package not installed. "
+                             "Run 'hermes setup tts' and choose Silero, or install manually: "
+                             "pip install silero",
+                }, ensure_ascii=False)
+            logger.info("Generating speech with Silero (local, PyTorch)...")
+            _generate_silero_tts(text, file_str, tts_config)
+
         else:
             # Default: Edge TTS (free), with NeuTTS as local fallback
             edge_available = True
@@ -2103,7 +2236,7 @@ def text_to_speech_tool(
                 voice_compatible = file_str.endswith(".ogg")
         elif (
             want_opus
-            and provider in {"edge", "neutts", "minimax", "xai", "kittentts", "piper"}
+            and provider in {"edge", "neutts", "minimax", "xai", "kittentts", "piper", "silero"}
             and not file_str.endswith(".ogg")
         ):
             opus_path = _convert_to_opus(file_str)
@@ -2202,6 +2335,8 @@ def check_tts_requirements() -> bool:
     if _check_kittentts_available():
         return True
     if _check_piper_available():
+        return True
+    if _check_silero_available():
         return True
     return False
 
