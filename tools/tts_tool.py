@@ -889,12 +889,51 @@ def _has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def _ffmpeg_convert(input_path: str, output_path: str) -> bool:
+    """Convert audio file using ffmpeg with format-aware codec selection.
+
+    For .ogg output, explicitly uses libopus (Telegram voice bubbles require
+    Opus; ffmpeg's default for .ogg is Vorbis which Telegram cannot play).
+
+    Returns True on success, False on failure.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+
+    ext = os.path.splitext(output_path)[1].lower()
+    if ext == ".ogg":
+        cmd = [
+            ffmpeg, "-i", input_path,
+            "-acodec", "libopus", "-ac", "1",
+            "-b:a", "64k", "-vbr", "off",
+            "-y", "-loglevel", "error",
+            output_path,
+        ]
+    else:
+        cmd = [ffmpeg, "-i", input_path, "-y", "-loglevel", "error", output_path]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
+        if result.returncode != 0:
+            logger.warning("ffmpeg conversion failed: %s",
+                          result.stderr.decode('utf-8', errors='ignore')[:200])
+            return False
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg conversion timed out after 60s")
+        return False
+    except Exception as e:
+        logger.warning("ffmpeg conversion failed: %s", e)
+        return False
+
+
 def _convert_to_opus(mp3_path: str) -> Optional[str]:
     """
-    Convert an MP3 file to OGG Opus format for Telegram voice bubbles.
+    Convert an audio file to OGG Opus format for Telegram voice bubbles.
 
     Args:
-        mp3_path: Path to the input MP3 file.
+        mp3_path: Path to the input audio file (MP3, WAV, etc.).
 
     Returns:
         Path to the .ogg file, or None if conversion fails.
@@ -903,24 +942,8 @@ def _convert_to_opus(mp3_path: str) -> Optional[str]:
         return None
 
     ogg_path = mp3_path.rsplit(".", 1)[0] + ".ogg"
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-i", mp3_path, "-acodec", "libopus",
-             "-ac", "1", "-b:a", "64k", "-vbr", "off", ogg_path, "-y"],
-            capture_output=True, timeout=30,
-        )
-        if result.returncode != 0:
-            logger.warning("ffmpeg conversion failed with return code %d: %s", 
-                          result.returncode, result.stderr.decode('utf-8', errors='ignore')[:200])
-            return None
-        if os.path.exists(ogg_path) and os.path.getsize(ogg_path) > 0:
-            return ogg_path
-    except subprocess.TimeoutExpired:
-        logger.warning("ffmpeg OGG conversion timed out after 30s")
-    except FileNotFoundError:
-        logger.warning("ffmpeg not found in PATH")
-    except Exception as e:
-        logger.warning("ffmpeg OGG conversion failed: %s", e, exc_info=True)
+    if _ffmpeg_convert(mp3_path, ogg_path):
+        return ogg_path
     return None
 
 
@@ -1517,22 +1540,8 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     try:
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
-            # For .ogg output, force libopus encoding (Telegram voice bubbles
-            # require Opus specifically; ffmpeg's default for .ogg is Vorbis).
-            if output_path.lower().endswith(".ogg"):
-                cmd = [
-                    ffmpeg, "-i", wav_path,
-                    "-acodec", "libopus", "-ac", "1",
-                    "-b:a", "64k", "-vbr", "off",
-                    "-y", "-loglevel", "error",
-                    output_path,
-                ]
-            else:
-                cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
-            result = subprocess.run(cmd, capture_output=True, timeout=30)
-            if result.returncode != 0:
-                stderr = result.stderr.decode("utf-8", errors="ignore")[:300]
-                raise RuntimeError(f"ffmpeg conversion failed: {stderr}")
+            if not _ffmpeg_convert(wav_path, output_path):
+                raise RuntimeError("ffmpeg conversion failed")
         else:
             logger.warning(
                 "ffmpeg not found; writing raw WAV to %s (extension may be misleading)",
@@ -1621,14 +1630,14 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
 
     # If the caller wanted .mp3 or .ogg, convert from WAV
     if wav_path != output_path:
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg:
-            conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
-            subprocess.run(conv_cmd, check=True, timeout=30)
-            os.remove(wav_path)
-        else:
+        if not _ffmpeg_convert(wav_path, output_path):
             # No ffmpeg — just rename the WAV to the expected path
             os.rename(wav_path, output_path)
+        else:
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
 
     return output_path
 
@@ -1779,17 +1788,14 @@ def _generate_piper_tts(text: str, output_path: str, tts_config: Dict[str, Any])
 
     # Convert to desired format if caller requested mp3/ogg
     if wav_path != output_path:
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg:
-            conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
-            subprocess.run(conv_cmd, check=True, timeout=30)
+        if not _ffmpeg_convert(wav_path, output_path):
+            # No ffmpeg — keep WAV and rename
+            os.rename(wav_path, output_path)
+        else:
             try:
                 os.remove(wav_path)
             except OSError:
                 pass
-        else:
-            # No ffmpeg — keep WAV and return that path
-            os.rename(wav_path, output_path)
 
     return output_path
 
@@ -1845,14 +1851,14 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 
     # Convert to desired format if needed
     if wav_path != output_path:
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg:
-            conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
-            subprocess.run(conv_cmd, check=True, timeout=30)
-            os.remove(wav_path)
-        else:
+        if not _ffmpeg_convert(wav_path, output_path):
             # No ffmpeg — rename the WAV to the expected path
             os.rename(wav_path, output_path)
+        else:
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
 
     return output_path
 
@@ -1979,17 +1985,14 @@ def _generate_silero_tts(text: str, output_path: str, tts_config: Dict[str, Any]
 
     # Convert to desired format if caller requested mp3/ogg
     if wav_path != output_path:
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg:
-            conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
-            subprocess.run(conv_cmd, check=True, timeout=60)
+        if not _ffmpeg_convert(wav_path, output_path):
+            # No ffmpeg -- keep WAV
+            os.rename(wav_path, output_path)
+        else:
             try:
                 os.remove(wav_path)
             except OSError:
                 pass
-        else:
-            # No ffmpeg -- keep WAV
-            os.rename(wav_path, output_path)
 
     return output_path
 
@@ -2144,8 +2147,9 @@ def text_to_speech_tool(
         if command_provider_config is not None:
             fmt = _get_command_tts_output_format(command_provider_config)
             file_path = out_dir / f"tts_{timestamp}.{fmt}"
-        # Use .ogg for Telegram with providers that support native Opus output,
-        # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
+        # Use .ogg for Telegram with providers that support native Opus output.
+        # Silero/Piper/NeuTTS/KittenTTS always output .mp3 (ffmpeg-converted from
+        # their native WAV) since Telegram bots cannot use send_voice.
         elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini"}:
             file_path = out_dir / f"tts_{timestamp}.ogg"
         else:
@@ -2340,7 +2344,7 @@ def text_to_speech_tool(
                 voice_compatible = file_str.endswith(".ogg")
         elif (
             want_opus
-            and provider in {"edge", "neutts", "minimax", "xai", "kittentts", "piper", "silero"}
+            and provider in {"edge", "minimax", "xai"}
             and not file_str.endswith(".ogg")
         ):
             opus_path = _convert_to_opus(file_str)

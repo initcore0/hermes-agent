@@ -19,7 +19,7 @@ def _get_num2words():
             from num2words import num2words as _n2w
             _num2words = _n2w
         except ImportError:
-            logger.warning("num2words not installed")
+            logger.debug("num2words not installed — numbers won't be converted to words")
             _num2words = None
     return _num2words
 
@@ -31,7 +31,7 @@ def _get_translit():
             from transliterate import translit as _tl
             _translit_fn = _tl
         except ImportError:
-            logger.warning("transliterate not installed")
+            logger.debug("transliterate not installed — English words in Russian text won't be transliterated")
     return _translit_fn
 
 
