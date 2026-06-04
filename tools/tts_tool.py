@@ -1904,6 +1904,19 @@ def _generate_silero_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     voice = silero_config.get("voice", DEFAULT_SILERO_VOICE)
     sample_rate = int(silero_config.get("sample_rate", DEFAULT_SILERO_SAMPLE_RATE))
 
+    # Normalize mixed Russian/English text for better Silero pronunciation.
+    # Enabled by default for Russian; disable via tts_config["silero"]["normalize_text"] = False
+    should_normalize = silero_config.get("normalize_text", True)
+    if should_normalize and language == "ru" and text:
+        try:
+            from tools.russian_tts_normalizer import normalize_for_russian_tts
+            text = normalize_for_russian_tts(text)
+            logger.debug("[Silero] Normalized text: %s", text[:200])
+        except ImportError:
+            logger.debug("[Silero] russian_tts_normalizer not available, skipping normalization")
+        except Exception as e:
+            logger.warning("[Silero] Text normalization failed: %s — proceeding with original", e)
+
     # Load model (cached by model name so subsequent calls are fast)
     cache_key = f"{model_name}::{language}"
     global _silero_model_cache
