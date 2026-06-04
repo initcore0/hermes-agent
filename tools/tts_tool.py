@@ -1882,10 +1882,14 @@ def _generate_silero_tts(text: str, output_path: str, tts_config: Dict[str, Any]
          The ``speaker`` parameter here selects the model variant (e.g. ``v5_ru``, ``v3_en``).
       2. ``model.apply_tts(text, speaker=voice, sample_rate=...)`` synthesizes audio.
          The ``speaker`` parameter here selects the voice within the model.
-      3. The model returns a torch.float32 1-D tensor at the requested sample rate.
+      3. The model returns a torch.float32 1-D tensor at the requested sample_rate.
 
     We write WAV via stdlib ``wave`` (int16), then ffmpeg-convert to MP3/Opus
     when the caller requested a different format.
+
+    Long text is split into sentences and synthesized in chunks to avoid
+    Silero's internal position encoding limit (~5000 tokens). Chunks are
+    concatenated with a brief silence gap between them.
 
     Note: Silero models do not support speed control -- the speed parameter
     is silently ignored.
@@ -1911,16 +1915,42 @@ def _generate_silero_tts(text: str, output_path: str, tts_config: Dict[str, Any]
 
     model, _example = _silero_model_cache[cache_key]
 
-    # Synthesize — model.apply_tts() returns torch.float32 tensor
-    logger.info("[Silero] Synthesizing with voice: %s", voice)
+    # Split long text into sentences to avoid Silero's ~5000 token PE limit.
+    # Each sentence is synthesized separately and concatenated.
     import torch
-    with torch.no_grad():
-        audio_tensor = model.apply_tts(text, speaker=voice, sample_rate=sample_rate)
+    chunks = _split_text_for_silero(text)
+    logger.info("[Silero] Synthesizing %d chunk(s) with voice: %s", len(chunks), voice)
 
-    # Convert torch float32 tensor -> numpy int16 for WAV.
-    # Silero outputs audio in [-1.0, 1.0] range; scale to int16 first,
-    # then clip to avoid overflow on edge cases.
-    audio_np = audio_tensor.cpu().numpy()
+    silence_samples = int(0.2 * sample_rate)  # 200ms silence between chunks
+    audio_parts = []
+
+    for i, chunk in enumerate(chunks):
+        if len(chunks) > 1:
+            logger.info("[Silero] Chunk %d/%d (%d chars)", i + 1, len(chunks), len(chunk))
+        try:
+            with torch.no_grad():
+                audio_tensor = model.apply_tts(chunk, speaker=voice, sample_rate=sample_rate)
+        except Exception as e:
+            # If a single chunk is still too long, try splitting it further
+            if "too long" in str(e).lower() or "size of tensor" in str(e).lower():
+                logger.warning("[Silero] Chunk %d too long, splitting further...", i + 1)
+                sub_chunks = _split_text_for_silero(chunk, max_chars=100)
+                for j, sub in enumerate(sub_chunks):
+                    logger.info("[Silero] Sub-chunk %d/%d", j + 1, len(sub_chunks))
+                    with torch.no_grad():
+                        sub_audio = model.apply_tts(sub, speaker=voice, sample_rate=sample_rate)
+                    audio_parts.append(sub_audio.cpu().numpy())
+                    if j < len(sub_chunks) - 1:
+                        audio_parts.append(np.zeros(silence_samples, dtype=np.float32))
+            else:
+                raise
+        else:
+            audio_parts.append(audio_tensor.cpu().numpy())
+            if i < len(chunks) - 1:
+                audio_parts.append(np.zeros(silence_samples, dtype=np.float32))
+
+    # Concatenate all audio parts
+    audio_np = np.concatenate(audio_parts)
     audio_int16 = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
 
     # Write WAV
@@ -1939,7 +1969,7 @@ def _generate_silero_tts(text: str, output_path: str, tts_config: Dict[str, Any]
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
             conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
-            subprocess.run(conv_cmd, check=True, timeout=30)
+            subprocess.run(conv_cmd, check=True, timeout=60)
             try:
                 os.remove(wav_path)
             except OSError:
@@ -1951,9 +1981,70 @@ def _generate_silero_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     return output_path
 
 
-# ===========================================================================
-# Main tool function
-# ===========================================================================
+def _split_text_for_silero(text: str, max_chars: int = 4000) -> list:
+    """Split text into sentence-level chunks for Silero TTS.
+
+    Silero's internal position encoding is limited to ~5000 positions.
+    A single long sentence can exceed this limit even if the character count
+    is under the provider cap. This function splits on sentence boundaries
+    while respecting a maximum chunk size in characters.
+
+    Args:
+        text: Input text to split.
+        max_chars: Maximum characters per chunk (default 4000, well under the 5000 cap).
+
+    Returns:
+        List of text chunks, each a complete sentence or group of sentences.
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    # Sentence boundary regex — splits on periods, exclamation, question marks,
+    # ellipses, and newlines followed by whitespace or end of string.
+    sentence_pattern = re.compile(r'(?<=[.!?…])\s+|\n')
+
+    sentences = sentence_pattern.split(text)
+    chunks = []
+    current_chunk = ""
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        # If a single sentence is longer than max_chars, hard-split it
+        if len(sentence) > max_chars:
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = ""
+            # Split the long sentence into max_chars-sized pieces
+            for j in range(0, len(sentence), max_chars):
+                chunks.append(sentence[j:j + max_chars])
+            continue
+
+        if len(current_chunk) + len(sentence) + 1 <= max_chars:
+            if current_chunk:
+                current_chunk += " " + sentence
+            else:
+                current_chunk = sentence
+        else:
+            if current_chunk:
+                chunks.append(current_chunk)
+            current_chunk = sentence
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    # If no chunks were created (single long "word" without spaces), 
+    # fall back to hard character-based splitting
+    if not chunks:
+        for i in range(0, len(text), max_chars):
+            chunks.append(text[i:i + max_chars])
+
+    return chunks if chunks else [text]
+
+
+
 def text_to_speech_tool(
     text: str,
     output_path: Optional[str] = None,
